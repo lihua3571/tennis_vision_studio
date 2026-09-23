@@ -63,15 +63,49 @@ def center(box: np.ndarray) -> tuple[int, int]:
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
-def nearest_candidate(candidates: list[tuple[int, int, float]], previous, max_jump: float):
+def predicted_ball_position(track_history: deque, frame_idx: int):
+    """Constant-velocity prediction using the median of recent track steps."""
+    if not track_history:
+        return None, (0.0, 0.0)
+    last_frame, last_x, last_y, *_ = track_history[-1]
+    velocities = []
+    recent = list(track_history)[-5:]
+    for previous, current in zip(recent[:-1], recent[1:]):
+        dt = current[0] - previous[0]
+        if 0 < dt <= 3:
+            velocities.append(((current[1] - previous[1]) / dt, (current[2] - previous[2]) / dt))
+    vx = float(np.median([v[0] for v in velocities])) if velocities else 0.0
+    vy = float(np.median([v[1] for v in velocities])) if velocities else 0.0
+    gap = max(1, frame_idx - last_frame)
+    return (last_x + vx * gap, last_y + vy * gap), (vx, vy)
+
+
+def select_ball_candidate(candidates, track_history: deque, frame_idx: int, diagonal: float):
+    """Score candidates by prediction, confidence, motion and direction continuity."""
     if not candidates:
         return None
-    if previous is None:
-        return max(candidates, key=lambda p: p[2])
-    valid = [p for p in candidates if math.dist(p[:2], previous[:2]) <= max_jump]
-    # A missing nearby candidate means a missed frame, not permission to jump to
-    # a logo, spectator or scoreboard elsewhere in the image.
-    return min(valid, key=lambda p: math.dist(p[:2], previous[:2])) if valid else None
+    prediction, velocity = predicted_ball_position(track_history, frame_idx)
+    if prediction is None:
+        # Require both detector confidence and local motion for a new track.
+        return max(candidates, key=lambda p: .65 * p[2] + .25 * min(1.0, p[3] / 12) + .10 * min(1.0, p[4] / .15))
+    last_frame, last_x, last_y, *_ = track_history[-1]
+    gap = max(1, frame_idx - last_frame)
+    gate = diagonal * min(.09, .014 + .020 * gap)
+    speed = math.hypot(*velocity)
+    scored = []
+    for candidate in candidates:
+        distance = math.dist(candidate[:2], prediction)
+        if distance > gate:
+            continue
+        observed = (candidate[0] - last_x, candidate[1] - last_y)
+        observed_speed = math.hypot(*observed)
+        direction = 1.0
+        if speed > 1.5 and observed_speed > 1.5:
+            direction = max(0.0, (observed[0] * velocity[0] + observed[1] * velocity[1]) / (observed_speed * speed))
+        score = (.56 * (1 - distance / gate) + .18 * candidate[2]
+                 + .14 * min(1.0, candidate[3] / 12) + .12 * direction)
+        scored.append((score, candidate))
+    return max(scored, key=lambda item: item[0])[1] if scored else None
 
 
 def local_motion(gray: np.ndarray, previous: np.ndarray | None, point: tuple[int, int]) -> tuple[float, float]:
@@ -98,7 +132,7 @@ def moving_ball_candidates(candidates: list[tuple[int, int, float]], gray: np.nd
         threshold = 1.3 if near_active else 2.5
         fraction_threshold = .015 if near_active else .035
         if motion >= threshold and changed_fraction >= fraction_threshold:
-            moving.append(candidate)
+            moving.append((*candidate, motion, changed_fraction))
     return moving
 
 
@@ -334,6 +368,7 @@ def process_video(video_path: str, conf: float, ball_conf: float, trail_seconds:
     trail = deque(maxlen=max(12, int(fps * trail_seconds)))
     last_ball = None
     last_seen_frame = -999
+    track_history = deque(maxlen=8)
     previous_grays = deque(maxlen=2)
     player_zone = court_polygon(width, height, expanded=False)
     ball_zone = court_polygon(width, height, expanded=True)
@@ -394,19 +429,22 @@ def process_video(video_path: str, conf: float, ball_conf: float, trail_seconds:
             players = sorted(players, key=player_rank, reverse=True)[:player_limit]
 
         gap = frame_idx - last_seen_frame
-        if gap > max(3, int(fps * .12)):
+        if gap > max(6, int(fps * .25)):
             last_ball = None
+            track_history.clear()
             trail.clear()
         balls = moving_ball_candidates(balls, gray, previous_grays, last_ball)
-        # A real tennis ball cannot teleport across a broadcast frame. Allow a
-        # larger first acquisition, then use a strict per-frame motion gate.
-        ball = nearest_candidate(balls, last_ball, max(width, height) * min(.10, .025 * max(1, gap)))
+        # Use several recent positions to predict the next location. Candidate
+        # confidence alone is insufficient because court-side static balls can
+        # intermittently receive a high detector score.
+        ball = select_ball_candidate(balls, track_history, frame_idx, math.hypot(width, height))
         ball_speed = 0.0
         if ball:
-            if last_ball is not None and frame_idx - last_seen_frame <= 3:
+            if last_ball is not None and frame_idx - last_seen_frame <= max(6, int(fps * .25)):
                 dt = max(1, frame_idx - last_seen_frame) / fps
                 ball_speed = math.dist(ball[:2], last_ball[:2]) / dt
             trail.append((ball[0], ball[1]))
+            track_history.append((frame_idx, ball[0], ball[1], ball[2]))
             last_ball, last_seen_frame = ball, frame_idx
 
         for i, (box, score) in enumerate(players, 1):
