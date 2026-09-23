@@ -1,0 +1,20 @@
+[Unit]
+Description=Tennis Vision Studio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tennis-vision-studio
+Environment=TENNIS_DEVICE=0
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=TENNIS_MODEL=yolo11m.pt
+Environment=TENNIS_BALL_MODEL=/opt/Good-Tennis/weights/tennis-ball.pt
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/miniconda3/envs/tennis/bin/python /opt/tennis-vision-studio/app.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
